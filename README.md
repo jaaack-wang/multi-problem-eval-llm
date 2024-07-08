@@ -3,8 +3,9 @@
 Current LLM evaluation predominantly performs evaluation with prompts comprising single problems, i.e., **single-problem evaluation**. We propose **multi-problem evaluation** as an additional approach to study the multiple problem handling capabilities of LLMs. We present a systematic study in this regard by comprehensively examining 7 LLMs on 4 related types of tasks (see the figure below) constructed from 6 classification benchmarks. 
 
 <p align='center'>
- <img align="center" src="plots/tasks-illustration.pdf">
+ <img align="center" src="plots/tasks-illustration.png">
 </p>
+
 
 The preprint is available in [arXiv](https://arxiv.org/pdf/2406.10786). 
 
