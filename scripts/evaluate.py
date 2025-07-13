@@ -1,11 +1,10 @@
 import re
 import pandas as pd
 
-import sys
-import pathlib
-# import from local script
-sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from parsing import parse_benchmark_model_completion
+try:
+    from parsing import parse_benchmark_model_completion
+except:
+    from scripts.parsing import parse_benchmark_model_completion
 
 
 def calculate_jaccardSim(set1, set2):
@@ -22,7 +21,7 @@ def evaluate_parsed_benchmark_model_performance(df):
     
     for task in df.task.unique():
         sub = df.copy()[df.task == task]
-        if task != "SelectOne":
+        if not task.startswith("index_selection_one_cat_a_time"):
             for ix in sub.index:
                 benchmark = df.at[ix, "benchmark"]
                 taskIndex = df.at[ix, "taskIndex"]
@@ -43,15 +42,15 @@ def evaluate_parsed_benchmark_model_performance(df):
                 num_contradictions = None
                 num_non_excluded_middles = None
 
-                if task == "SingleClf":
+                if task == "single_clf":
                     perTaskAccu = float(parsed.lower() == answer.lower())
 
-                elif task == "BatchClf":
+                elif task == "batch_clf":
                     n, m = len(answer), len(parsed)
                     perTaskAccu = sum([float(a == p) for a, p in zip(answer, parsed)]) / n
                     num_dif = n - m
                 
-                elif task == "SelectAll":
+                elif task.startswith("index_selection_all_cat_at_once"):
 
                     answer_ix2cat = dict()
                     parsed_ix2cat = dict()
@@ -94,7 +93,7 @@ def evaluate_parsed_benchmark_model_performance(df):
                             perTaskAccu, jaccardSim, num_dif, num_contradictions, num_non_excluded_middles])
             
         else:
-            # this is because the task can be SelectOne
+            # this is because the task can be: index_selection_one_cat_a_time or index_selection_one_cat_a_time_json
             for benchmark in sub.benchmark.unique():
                 subsub = sub.copy()[sub.benchmark == benchmark]
                 # sorted the dataframe to make sure the same taskIndex from the same conditions appear in consecutive rows 
@@ -121,7 +120,7 @@ def evaluate_parsed_benchmark_model_performance(df):
                         if parsed == {"None"}:
                             parsed = set()
                         elif parsed == {"All"}:
-                            parsed = set(range(1, taskSize+1))
+                            parsed = set(range(1, taskSize))
                         
                         jaccardSims.append(calculate_jaccardSim(answer, parsed))
                         for a in answer:
@@ -166,9 +165,48 @@ def evaluate_parsed_benchmark_model_performance(df):
     return pd.DataFrame(out, columns=cols)
 
 
-def get_parse_rate_and_performance(benchmarks, models, tasks=["SingleClf"], CoT=[False, True], 
-                                   return_evaluated_df=False, SelectOne_json_output=True,  
-                                   res_dir="results/text classification"):
+def get_max_random_baseline(df):
+    sub = df.copy()[df.task == "single_clf"].drop_duplicates(subset=["prompt", "answer"])
+    return max(sub["answer"].value_counts()) / len(sub)
+
+
+# def get_parse_rate_and_performance(benchmarks, models, tasks=["single_clf"], return_evaluated_df=False):
+#     out = []
+#     cols = ["benchmark", "task", "taskSize", "model", "parse_rate", "performance"]
+    
+#     if return_evaluated_df:
+#         eval_dfs = []
+
+#     for benchmark in benchmarks:
+#         df = parse_benchmark_model_completion(benchmark, models, tasks)
+#         if "single_clf" in tasks:
+#             out.append([benchmark, "single_clf", 1, "random baseline", "-", get_max_random_baseline(df)])
+
+#         df = evaluate_parsed_benchmark_model_performance(df)
+#         if return_evaluated_df:
+#             eval_dfs.append(df)
+
+#         for task in tasks:
+#             sub = df.copy()[df.task == task]
+#             taskSizes = sub.taskSize.unique()
+
+#             for taskSize in taskSizes:
+#                 subsub = sub.copy()[sub.taskSize == taskSize]
+#                 for model in models:
+#                     parsed = subsub[subsub.model == model]["parsed"]
+#                     parse_rate = (parsed != "CANNOT_PARSE").mean()
+#                     accu = subsub[subsub.model == model]["perTaskAccu"].mean()
+#                     out.append([benchmark, task, taskSize, model, parse_rate, accu])
+
+#     out = pd.DataFrame(out, columns=cols)
+
+#     if return_evaluated_df:
+#         eval_dfs = pd.concat(eval_dfs).reset_index(drop=True)
+#         return out, eval_dfs
+    
+#     return out
+
+def get_parse_rate_and_performance(benchmarks, models, tasks=["single_clf"], CoT=[False, True], return_evaluated_df=False):
     out = []
     cols = ["benchmark", "task", "taskSize", "model", "CoT", "#shot", "parse_rate", "performance"]
     
@@ -176,7 +214,10 @@ def get_parse_rate_and_performance(benchmarks, models, tasks=["SingleClf"], CoT=
         eval_dfs = []
 
     for benchmark in benchmarks:
-        df = parse_benchmark_model_completion(benchmark, models, tasks, CoT, SelectOne_json_output, res_dir)
+        df = parse_benchmark_model_completion(benchmark, models, tasks)
+        if "single_clf" in tasks:
+            out.append([benchmark, "single_clf", 1, "random baseline", "-", get_max_random_baseline(df)])
+
         df = evaluate_parsed_benchmark_model_performance(df)
         if return_evaluated_df:
             eval_dfs.append(df)
@@ -206,3 +247,61 @@ def get_parse_rate_and_performance(benchmarks, models, tasks=["SingleClf"], CoT=
         return out, eval_dfs
     
     return out
+
+
+def answer_cleansing(pred, method, dataset, direct_answer_trigger_for_fewshot):
+    '''Post process LLM completions for the evaluation based on single-question prompts. 
+        Adapted from https://github.com/kojima-takeshi188/zero_shot_cot'''
+    
+    if len(pred) != 0 and pred[-1] in ["A", "B", "C", "D", "E", "F"]:
+        pred += "."
+    if method in ("few-shot", "few-shot-cot"):
+        preds = pred.split(direct_answer_trigger_for_fewshot)
+        answer_flag = True if len(preds) > 1 else False 
+        pred = preds[-1]
+
+    # add "(?=\W)" to avoid extracting answer options from a capitalized names for all multiple choice datasets
+    if dataset in ("aqua", "commonsensqa"):
+        pred = re.findall(r'(A|B|C|D|E)(?=\W)', pred)
+    elif dataset == "bigbench_date":
+        pred = re.findall(r'(A|B|C|D|E|F)(?=\W)', pred)
+    elif dataset in ("object_tracking"):
+        # pred = re.sub(r"Alice|Bob|Claire", "", pred)
+        pred = re.findall(r'(A|B|C)(?=\W)', pred)
+    elif dataset in ("gsm8k", "addsub", "multiarith", "svamp", "singleeq"):
+        pred = pred.replace(",", "")
+        pred = [s for s in re.findall(r'-?\d+\.?\d*', pred)]
+    elif dataset in ("strategyqa", "coin_flip"):
+        pred = pred.lower()
+        pred = re.sub("\"|\'|\n|\.|\s|\:|\,"," ", pred)
+        pred = pred.split(" ")
+        pred = [i for i in pred if i in ("yes", "no")]
+    elif dataset == "last_letters":
+        pred = re.sub("\"|\'|\n|\.|\s","", pred)
+        pred = [pred]
+    else:
+        raise ValueError("dataset is not properly defined ...")
+
+    # If there is no candidate in list, null is set.
+    if len(pred) == 0:
+        pred = ""
+    else:
+        if method in ("few-shot", "few-shot-cot"):
+            if answer_flag:
+                # choose the first element in list ...
+                pred = pred[0]
+            else:
+                # choose the last element in list ...
+                pred = pred[-1]
+        elif method in ("zero-shot", "zero-shot-cot"):
+            # choose the first element in list ...
+            pred = pred[0]
+        else:
+            raise ValueError("method is not properly defined ...")
+    
+    # (For arithmetic tasks) if a word ends with period, it will be omitted ...
+    if pred != "":
+        if pred[-1] == ".":
+            pred = pred[:-1]
+        
+    return pred

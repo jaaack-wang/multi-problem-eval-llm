@@ -1,7 +1,9 @@
+
 import os
 import re
 import json
 import pandas as pd
+from collections import Counter
 
 
 benchmarks_gt_labels = {}
@@ -13,13 +15,12 @@ for benchmark in os.listdir("data/databases/text classification/"):
     benchmarks_gt_labels[name] = pd.read_pickle(f"data/databases/text classification/{benchmark}")["labels"]
 
 benchmarks_gt_labels["AGNews-simplified_index_selection_only"] = benchmarks_gt_labels["AGNews"]
-benchmarks_gt_labels["CoLA_2_shot"] = benchmarks_gt_labels["CoLA"]
+benchmarks_gt_labels["CoLA_few_shot"] = benchmarks_gt_labels["CoLA"]
 
 RECOGNIZED_BENCHMARKS = set(benchmarks_gt_labels.keys())
 
 
-def extract_answer(completion, task, benchmark, model=None, taskSize=None, 
-                   targetLabel=None, print_unparsable=False, SelectOne_json_output=True):
+def extract_answer(completion, task, benchmark, model=None, taskSize=None, targetLabel=None, print_unparsable=False):
     if not isinstance(completion, str):
         return "CANNOT_PARSE"
 
@@ -28,13 +29,13 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
                                                 f"Recognized benchmarks: {list(benchmarks_gt_labels.keys())}"
     labels = benchmarks_gt_labels[benchmark]
 
-    if task != "SingleClf":
-        assert taskSize is not None, "taskSize must be provided for tasks other than SingleClf"
+    if task != "single_clf":
+        assert taskSize is not None, "taskSize must be provided for tasks other than single_clf"
 
-    if task == "SelectOne":
-        assert targetLabel is not None, "targetLabel must be provided for SelectOne tasks" 
+    if task.startswith("index_selection_one_cat_a_time"):
+        assert targetLabel is not None, "targetLabel must be provided for index_selection_one_cat_a_time tasks" 
 
-    if task == "SingleClf":
+    if task == "single_clf":
         for flags in [0, re.I]: # fistr strict (case-sentiive), then case-insensitive
             target = re.search(r"\b(" + "|".join(labels) + r")\b", completion, flags=flags)
             if target:
@@ -65,20 +66,8 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
                 return "No"
             if "is a paraphrase of" in completion.lower():
                 return "Yes"
-
-        if model == "mistralai/Mistral-7B-Instruct-v0.2" and benchmark=="SST-2-inference":
-            # do not use "flags=re.I" here to ensure the captured pattern appears in one sentence  
-            if not re.search(r"\b(not possible to determine|impossible to determine|unable to determine|difficult to determine|cannot determine|not directly comparable)\b", completion):
-                if re.search(r"\bsentiments?.*not\b.* same", completion):
-                    return "No"
-                elif re.search(r"\bsentiments?.* different from", completion):
-                    return "No"
-                elif re.search(r"\bdoe?s? not share the same sentiment", completion):
-                    return "No"
-                elif re.search(r"\bshares the same sentiment", completion):
-                    return "Yes"
     
-    elif task == "BatchClf":
+    elif task == "batch_clf":
         # for sentiment analysis, "Neutral" and "Mixed" are found to be frequently predicted labels
         # important to include them here to ensure the order of predicted labels are correct
         if benchmark in {"SST-2"}:
@@ -101,15 +90,15 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
         # adding "\n" to the two sides of completion in case the completion starts/end with the index
         indexed_texts = re.split(r"\n\d+\. ?", "\n" + completion.strip() + "\n", flags=re.I)[1:] 
 
-        # if there are as many lines as the questions, treat each line as a SingleClf problem 
+        # if there are as many lines as the questions, treat each line as a single_clf problem 
         if len(indexed_texts) == taskSize:
-            return [extract_answer(text, "SingleClf", benchmark, model, None, False) for text in indexed_texts]
+            return [extract_answer(text, "single_clf", benchmark, model, None, False) for text in indexed_texts]
         
         # if none of the above works, just return targets which capture all the desired labels
         if len(targets) != 0:
             return targets
     
-    elif task == "SelectOne" and not SelectOne_json_output:
+    elif task == "index_selection_one_cat_a_time":
         completion = "\n" + completion.strip() + "\n"
         completion = re.sub(r"\n+", "\n", completion) # remove redundant lines 
 
@@ -198,7 +187,7 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
         if "all" in completion and "none" not in completion:
             return ["All"]
 
-    elif task == "SelectOne":
+    elif task == "index_selection_one_cat_a_time_json":
         choices = [str(i) for i in range(1, taskSize + 1)] + ["None", "All"]
         json_output = re.search("\{[^}]+}", completion)
         # first, try to get all the numbers inside the json_output
@@ -232,7 +221,8 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
             if "all" in completion and "none" not in completion:
                 return ["All"]
 
-    elif task == "SelectAll":  
+    elif task in {"index_selection_all_cat_at_once", 
+                  "index_selection_all_cat_at_once_adjusted"}:  
         
         out = dict()
         try:
@@ -300,10 +290,9 @@ def extract_answer(completion, task, benchmark, model=None, taskSize=None,
 
 
 # helper function to inspect some sampled parsing results
-def check_model_outputs(benchmarks, models, task="SingleClf", model_first=False, 
-                        taskSize=None, sample_size=10, extract_func=None, 
-                        SelectOne_json_output=True, res_dir="results/text classification",
-                        show_answer=True, show_completion=True, print_unparsable=False, print_unparsable_only=False):
+def check_model_outputs(benchmarks, models, task="single_clf", model_first=False, 
+                        taskSize=None, sample_size=10, extract_func=None, show_answer=True, 
+                        show_completion=True, print_unparsable=False, print_unparsable_only=False):
     if model_first:
         cols1, cols2 = models, benchmarks
         c1_name, c2_name = "Model", "Benchmark"
@@ -327,7 +316,10 @@ def check_model_outputs(benchmarks, models, task="SingleClf", model_first=False,
             else:
                 benchmark, model = col1, col2 
             
-            df = read_benchmark_results(benchmark, res_dir)
+            df = read_benchmark_results(benchmark)
+
+            if task not in df.task.unique() and task.replace("_json", "").replace("_adjusted", "") in df.task.unique():
+                task = task.replace("_json", "").replace("_adjusted", "")
 
             if task in df.task.unique():
                 df = df.copy()[df.task == task]
@@ -338,11 +330,11 @@ def check_model_outputs(benchmarks, models, task="SingleClf", model_first=False,
             for ix in df.sample(min(sample_size, len(df))).index:
                 print("-" * 50 + f" Benchmark: {benchmark}; Row Index: {ix} " + "-" * 50)
 
-                if task != "SingleClf":
+                if task != "single_clf":
                     print("taskSize ==>", df.at[ix, "taskSize"])
 
                 targetLabel = df.at[ix, "targetLabel"]
-                if "SelectOne" in task:
+                if "index_selection_one_cat_a_time" in task:
                     print("targetLabel ==>", targetLabel)
 
                 completion = df.at[ix, f"{col2}-completion"] if not model_first else df.at[ix, f"{col1}-completion"]
@@ -351,8 +343,7 @@ def check_model_outputs(benchmarks, models, task="SingleClf", model_first=False,
                     print("Completion ==>", completion)
                     
                 if extract_func is not None:
-                    extracted = extract_func(completion, task, benchmark, model, df.at[ix, "taskSize"], 
-                                             targetLabel, print_unparsable, SelectOne_json_output)
+                    extracted = extract_func(completion, task, benchmark, model, df.at[ix, "taskSize"], targetLabel, print_unparsable)
                     if not print_unparsable_only:
                         print("Extracted ==>", extracted)
 
@@ -360,8 +351,8 @@ def check_model_outputs(benchmarks, models, task="SingleClf", model_first=False,
                     print("Answer ==>", df.at[ix, "answer"])
 
 
-def read_benchmark_results(benchmark, res_dir="results/text classification"):
-    return pd.read_json(os.path.join(res_dir, f"{benchmark}.json"), lines=True)
+def read_benchmark_results(benchmark):
+    return pd.read_json(f"results/text classification/{benchmark}.json", lines=True)
 
 
 def get_models(df):
@@ -369,17 +360,15 @@ def get_models(df):
 
 
 # helper function to inspect **a** specific parsing result
-def quick_check(benchmark, ix, task, model, return_completion=False, show_answer=True, 
-                SelectOne_json_output=True, res_dir="results/text classification"):
-    df = read_benchmark_results(benchmark, res_dir)
+def quick_check(benchmark, ix, task, model, return_completion=False, show_answer=True):
+    df = read_benchmark_results(benchmark)
     task = df.at[ix, "task"]
     answer = df.at[ix, "answer"]
     taskSize = df.at[ix, "taskSize"]
     targetLabel = df.at[ix, "targetLabel"]
     comp = df.at[ix, f"{model}-completion"]
     extracted = extract_answer(comp, task, benchmark, model, taskSize=taskSize, 
-                               targetLabel=targetLabel, print_unparsable=False, 
-                               SelectOne_json_output=SelectOne_json_output)
+                               targetLabel=targetLabel, print_unparsable=False)
     
     if return_completion:
         return comp
@@ -392,11 +381,9 @@ def quick_check(benchmark, ix, task, model, return_completion=False, show_answer
         print("Answer ==>", answer)
 
 
-def parse_benchmark_model_completion(benchmark, models, tasks, CoT=[False, True], 
-                                     SelectOne_json_output=True, res_dir="results/text classification"):
-    df = read_benchmark_results(benchmark, res_dir)
+def parse_benchmark_model_completion(benchmark, models, tasks):
+    df = read_benchmark_results(benchmark)
     df = df.copy()[df.task.isin(tasks)]
-    df = df.copy()[df.CoT.isin(CoT)]
     deployed_models = set(get_models(df))
 
     for model in models:
@@ -421,16 +408,15 @@ def parse_benchmark_model_completion(benchmark, models, tasks, CoT=[False, True]
         
         for model in models:
             completion = df.at[ix, f"{model}-completion"]
-            parsed = extract_answer(completion, task, benchmark, model, taskSize, targetLabel, False, SelectOne_json_output)
+            parsed = extract_answer(completion, task, benchmark, model, taskSize, targetLabel, False)
             out.append([benchmark, taskIndex, prompt, answer, targetLabel, task, num_shot, 
                         cot, taskSize, model, completion, parsed])
 
     return pd.DataFrame(out, columns=cols)
 
 
-def parse_benchmarks_models_completions(benchmarks, models, tasks, CoT=[False, True], 
-                                        SelectOne_json_output=True, res_dir="results/text classification"):
+def parse_benchmarks_models_completions(benchmarks, models, tasks):
     out = []
     for benchmark in benchmarks:
-        out.append(parse_benchmark_model_completion(benchmark, models, tasks, CoT, SelectOne_json_output, res_dir))
+        out.append(parse_benchmark_model_completion(benchmark, models, tasks))
     return pd.concat(out)
